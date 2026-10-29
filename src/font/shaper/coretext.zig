@@ -64,9 +64,9 @@ pub const Shaper = struct {
     /// attributed strings.
     cached_fonts: std.ArrayListUnmanaged(?*macos.foundation.Dictionary),
 
-    /// The grid that our cached fonts correspond to.
+    /// The id of the grid that our cached fonts correspond to.
     /// If the grid changes then we need to reset our cache.
-    cached_font_grid: usize,
+    cached_font_grid: u64,
 
     /// The list of CoreFoundation objects to release on the dedicated
     /// release thread. This is built up over the course of shaping and
@@ -552,9 +552,9 @@ pub const Shaper = struct {
     ) !*macos.foundation.Dictionary {
         // If this grid doesn't match the one we've cached fonts for,
         // then we reset the cache list since it's no longer valid.
-        // We use an intFromPtr rather than direct pointer comparison
-        // because we don't want anyone to inadvertently use the pointer.
-        const grid_id: usize = @intFromPtr(grid);
+        // We compare grid ids rather than pointers because a new grid
+        // can be allocated at the address of a grid that was just freed.
+        const grid_id = grid.id;
         if (grid_id != self.cached_font_grid) {
             if (self.cached_font_grid > 0) {
                 // Put all the currently cached fonts in to
@@ -2514,6 +2514,68 @@ test "shape high plane sprite font codepoint" {
     try testing.expect(run.font_index.special() != null);
     // And we should get a null run after that
     try testing.expectEqual(null, try it.next(alloc));
+}
+
+test "shape after grid is replaced at the same address" {
+    // A freed grid's memory can be reused for the next grid. The shaper
+    // must not keep the old grid's fonts when that happens, or glyph
+    // indices from one face get rendered with another.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaper(alloc);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("a");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+
+    // Shape once so the shaper caches the current grid's fonts.
+    {
+        var it = shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+        });
+        _ = try shaper.shape((try it.next(alloc)).?);
+    }
+
+    // Replace the grid in place with one whose regular face differs.
+    {
+        var c = Collection.init();
+        c.load_options = .{ .library = testdata.lib };
+        _ = try c.add(alloc, try .init(
+            testdata.lib,
+            font.embedded.jetbrains_mono,
+            .{ .size = .{ .points = 12 } },
+        ), .{
+            .style = .regular,
+            .fallback = false,
+            .size_adjustment = .none,
+        });
+
+        testdata.grid.deinit(alloc);
+        testdata.grid.* = try .init(alloc, .{ .collection = c });
+    }
+
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    const run = (try it.next(alloc)).?;
+    const cells = try shaper.shape(run);
+    try testing.expectEqual(1, cells.len);
+
+    const face = try testdata.grid.resolver.collection.getFace(run.font_index);
+    try testing.expectEqual(face.glyphIndex('a').?, cells[0].glyph_index);
 }
 
 const TestShaper = struct {
